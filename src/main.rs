@@ -1,13 +1,17 @@
 use std::{collections::HashMap, env, fs, path::PathBuf, str::FromStr};
 
 use anyhow::Result;
+use enum_as_inner::EnumAsInner;
 use regex::Regex;
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter, EnumString};
 
+// Note that for the ESP32, since we are not using an RTOS we need to use the
+// 'xtensa_esp108' overlay instead of the 'xtensa_esp32' overlay.
+// https://docs.espressif.com/projects/esp-idf/en/v3.3.5/api-guides/jtag-debugging/tips-and-quirks.html
 #[derive(Debug, Clone, Copy, PartialEq, Display, EnumIter)]
 enum Chip {
-    #[strum(to_string = "xtensa_esp32")]
+    #[strum(to_string = "xtensa_esp108")]
     Esp32,
     #[strum(to_string = "xtensa_esp32s2")]
     Esp32s2,
@@ -47,7 +51,7 @@ enum InterruptType {
     TimerUnconfigured,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, EnumAsInner)]
 enum Value {
     Integer(i64),
     Interrupt(InterruptType),
@@ -56,30 +60,22 @@ enum Value {
 
 fn main() -> Result<()> {
     for chip in Chip::iter() {
-        let defines = find_all_defines(chip)?;
-        let _config = parse_defines(defines)?;
+        println!("{}", chip);
+
+        // Parse the definitions for each chip from its 'core-isa.h' file. Note that for
+        // the ESP32 there is a single definition which requires special handling.
+        let mut config = parse_defines(chip)?;
+        if chip == Chip::Esp32 {
+            fix_esp32_xchal_use_memctl(&mut config);
+        }
+
+        println!("\n{:#?}\n\n", config);
     }
 
     Ok(())
 }
 
-fn find_all_defines(chip: Chip) -> Result<Vec<String>> {
-    let path = chip.core_isa_path()?;
-    let lines = fs::read_to_string(path)?
-        .lines()
-        .filter_map(|line| {
-            if line.starts_with("#define") {
-                Some(line.to_string())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    Ok(lines)
-}
-
-fn parse_defines(defines: Vec<String>) -> Result<HashMap<String, Value>> {
+fn parse_defines(chip: Chip) -> Result<HashMap<String, Value>> {
     let re_define = Regex::new(r"^#define[\s]+([a-zA-Z\d_]+)[\s]+([^\s]+)")?;
     let re_ident = Regex::new(r"^[a-zA-Z\d_]+$")?;
     let re_string = Regex::new(r#""([^"]+)""#)?;
@@ -87,7 +83,7 @@ fn parse_defines(defines: Vec<String>) -> Result<HashMap<String, Value>> {
     // Iterate through each line containing a definition. Attempt to match the
     // various components and map identifiers to values.
     let mut map: HashMap<String, Value> = HashMap::new();
-    for define in defines {
+    for define in find_all_defines(chip)? {
         if !re_define.is_match(&define) {
             println!("Define not matched: {}", define);
             continue;
@@ -113,7 +109,10 @@ fn parse_defines(defines: Vec<String>) -> Result<HashMap<String, Value>> {
             // Identifier
             map.get(&value).unwrap().to_owned()
         } else {
-            println!("Unable to process definition: {} = {}", identifier, value);
+            // We will handle this particular case after, so no need to report it.
+            if chip != Chip::Esp32 && identifier != "XCHAL_USE_MEMCTL" {
+                println!("Unable to process definition: {} = {}", identifier, value);
+            }
             continue;
         };
 
@@ -121,4 +120,50 @@ fn parse_defines(defines: Vec<String>) -> Result<HashMap<String, Value>> {
     }
 
     Ok(map)
+}
+
+fn find_all_defines(chip: Chip) -> Result<Vec<String>> {
+    let path = chip.core_isa_path()?;
+    let lines = fs::read_to_string(path)?
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with("#define") {
+                Some(line.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(lines)
+}
+
+fn fix_esp32_xchal_use_memctl(map: &mut HashMap<String, Value>) {
+    // NOTE: the value of `use_memctl` should subsequently be AND'ed with
+    //       '(XCHAL_HW_MIN_VERSION >= XTENSA_HWVERSION_RE_2012_0)', however
+    //       the latter identifier is not defined anywhere.
+    macro_rules! to_integer {
+        ($identifier:expr) => {
+            map.get($identifier)
+                .unwrap()
+                .as_integer()
+                .unwrap()
+                .to_owned()
+        };
+    }
+
+    let loop_buffer_size = to_integer!("XCHAL_LOOP_BUFFER_SIZE");
+    let dcache_is_coherent = to_integer!("XCHAL_DCACHE_IS_COHERENT");
+    let have_icache_dyn_ways = to_integer!("XCHAL_HAVE_ICACHE_DYN_WAYS");
+    let have_dcache_dyn_ways = to_integer!("XCHAL_HAVE_DCACHE_DYN_WAYS");
+
+    let use_memctl = (loop_buffer_size > 0)
+        || dcache_is_coherent != 0
+        || have_icache_dyn_ways != 0
+        || have_dcache_dyn_ways != 0;
+
+    let identifier = String::from("XCHAL_USE_MEMCTL");
+    let value = Value::Integer(use_memctl as i64);
+
+    map.insert(identifier, value);
 }
