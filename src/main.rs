@@ -7,31 +7,22 @@ use strum_macros::{Display, EnumIter, EnumString};
 
 #[derive(Debug, Clone, Copy, PartialEq, Display, EnumIter)]
 enum Chip {
-    #[strum(to_string = "esp32")]
+    #[strum(to_string = "xtensa_esp32")]
     Esp32,
-    #[strum(to_string = "esp32s2")]
+    #[strum(to_string = "xtensa_esp32s2")]
     Esp32s2,
-    #[strum(to_string = "esp32s3")]
+    #[strum(to_string = "xtensa_esp32s3")]
     Esp32s3,
-    #[strum(to_string = "esp8266")]
+    #[strum(to_string = "xtensa_lx106")]
     Esp8266,
 }
 
 impl Chip {
     fn core_isa_path(&self) -> Result<PathBuf> {
-        use Chip::*;
-
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("xtensa-overlays")
-            .join(match self {
-                Esp32 => "xtensa_esp32",
-                Esp32s2 => "xtensa_esp32s2",
-                Esp32s3 => "xtensa_esp32s3",
-                Esp8266 => "xtensa_lx106",
-            })
-            .join(PathBuf::from(
-                "newlib/newlib/libc/sys/xtensa/include/xtensa/config/core-isa.h",
-            ))
+            .join(self.to_string())
+            .join("newlib/newlib/libc/sys/xtensa/include/xtensa/config/core-isa.h")
             .canonicalize()?;
 
         Ok(path)
@@ -39,7 +30,7 @@ impl Chip {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, EnumString)]
-enum IntType {
+enum InterruptType {
     #[strum(serialize = "XTHAL_INTTYPE_EXTERN_EDGE")]
     ExternEdge,
     #[strum(serialize = "XTHAL_INTTYPE_EXTERN_LEVEL")]
@@ -56,10 +47,11 @@ enum IntType {
     TimerUnconfigured,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Value {
     Integer(i64),
-    Interrupt(IntType),
+    Interrupt(InterruptType),
+    String(String),
 }
 
 fn main() -> Result<()> {
@@ -90,17 +82,14 @@ fn find_all_defines(chip: Chip) -> Result<Vec<String>> {
 fn parse_defines(defines: Vec<String>) -> Result<HashMap<String, Value>> {
     let re_define = Regex::new(r"^#define[\s]+([a-zA-Z\d_]+)[\s]+([^\s]+)")?;
     let re_ident = Regex::new(r"^[a-zA-Z\d_]+$")?;
+    let re_string = Regex::new(r#""([^"]+)""#)?;
 
     // Iterate through each line containing a definition. Attempt to match the
-    // various components and map identifiers to values. In the case that a value is
-    // another identifier, keep track of this for the next pass.
-    let mut map = HashMap::new();
-    let mut dependants = HashMap::new();
-
-    let mut unmatched = 0;
+    // various components and map identifiers to values.
+    let mut map: HashMap<String, Value> = HashMap::new();
     for define in defines {
         if !re_define.is_match(&define) {
-            unmatched += 1;
+            println!("Define not matched: {}", define);
             continue;
         }
 
@@ -108,33 +97,27 @@ fn parse_defines(defines: Vec<String>) -> Result<HashMap<String, Value>> {
         let identifier = captures.get(1).unwrap().as_str().to_string();
         let value = captures.get(2).unwrap().as_str().to_string();
 
-        if let Ok(integer) = value.parse::<i64>() {
+        let value = if let Ok(integer) = value.parse::<i64>() {
             // Decimal integer literal
-            map.insert(identifier, Value::Integer(integer));
+            Value::Integer(integer)
         } else if let Ok(integer) = i64::from_str_radix(&value.replace("0x", ""), 16) {
             // Hexadecimal integer literal
-            map.insert(identifier, Value::Integer(integer));
-        } else if let Ok(interrupt) = IntType::from_str(&value) {
+            Value::Integer(integer)
+        } else if let Ok(interrupt) = InterruptType::from_str(&value) {
             // Interrupt type
-            map.insert(identifier, Value::Interrupt(interrupt));
-        } else if re_ident.is_match(&value) {
+            Value::Interrupt(interrupt)
+        } else if re_string.is_match(&value) {
+            // String
+            Value::String(value.replace("\"", ""))
+        } else if re_ident.is_match(&value) && map.contains_key(&value) {
             // Identifier
-            dependants.insert(identifier, value);
+            map.get(&value).unwrap().to_owned()
         } else {
-            println!("Unrecognized value: {}", value);
-        }
-    }
+            println!("Unable to process definition: {} = {}", identifier, value);
+            continue;
+        };
 
-    println!("{} defines matched, {} unmatched", map.len(), unmatched);
-
-    // Once we have iterated through all of the definitions, we can address any
-    // dependant identifiers.
-    for (identifier, value) in dependants {
-        if map.contains_key(&value) {
-            map.insert(identifier.clone(), *map.get(&value).unwrap());
-        } else {
-            println!("Dependant not found: {} = {}", identifier, value);
-        }
+        map.insert(identifier, value);
     }
 
     Ok(map)
