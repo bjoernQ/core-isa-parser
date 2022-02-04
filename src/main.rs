@@ -1,10 +1,31 @@
-use std::{collections::HashMap, env, fs, path::PathBuf, str::FromStr};
+use std::{fs, path::PathBuf, str::FromStr};
 
 use anyhow::Result;
 use enum_as_inner::EnumAsInner;
-use regex::Regex;
+use nom::{
+    branch::alt,
+    bytes::complete::{is_not, tag},
+    character::complete::{alpha1, alphanumeric1, char, digit1, hex_digit1, multispace1},
+    combinator::{map_res, recognize},
+    multi::many0,
+    sequence::{delimited, pair, preceded},
+    IResult,
+};
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter, EnumString};
+
+fn main() -> Result<()> {
+    for chip in Chip::iter() {
+        let path = chip.core_isa_path()?;
+        let text = fs::read_to_string(path)?;
+
+        let parsed = text.parse::<DefinedValue>();
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 
 // Note that for the ESP32, since we are not using an RTOS we need to use the
 // 'xtensa_esp108' overlay instead of the 'xtensa_esp32' overlay.
@@ -52,118 +73,56 @@ enum InterruptType {
 }
 
 #[derive(Debug, Clone, PartialEq, EnumAsInner)]
-enum Value {
+enum DefinedValue {
     Integer(i64),
     Interrupt(InterruptType),
     String(String),
 }
 
-fn main() -> Result<()> {
-    for chip in Chip::iter() {
-        println!("{}", chip);
+impl FromStr for DefinedValue {
+    type Err = anyhow::Error;
 
-        // Parse the definitions for each chip from its 'core-isa.h' file. Note that for
-        // the ESP32 there is a single definition which requires special handling.
-        let mut config = parse_defines(chip)?;
-        if chip == Chip::Esp32 {
-            fix_esp32_xchal_use_memctl(&mut config);
-        }
-
-        println!("\n{:#?}\n\n", config);
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        todo!()
     }
-
-    Ok(())
 }
 
-fn parse_defines(chip: Chip) -> Result<HashMap<String, Value>> {
-    let re_define = Regex::new(r"^#define[\s]+([a-zA-Z\d_]+)[\s]+([^\s]+)")?;
-    let re_ident = Regex::new(r"^[a-zA-Z\d_]+$")?;
-    let re_string = Regex::new(r#""([^"]+)""#)?;
+// ---------------------------------------------------------------------------
 
-    // Iterate through each line containing a definition. Attempt to match the
-    // various components and map identifiers to values.
-    let mut map: HashMap<String, Value> = HashMap::new();
-    for define in find_all_defines(chip)? {
-        if !re_define.is_match(&define) {
-            println!("Define not matched: {}", define);
-            continue;
-        }
-
-        let captures = re_define.captures(&define).unwrap();
-        let identifier = captures.get(1).unwrap().as_str().to_string();
-        let value = captures.get(2).unwrap().as_str().to_string();
-
-        let value = if let Ok(integer) = value.parse::<i64>() {
-            // Decimal integer literal
-            Value::Integer(integer)
-        } else if let Ok(integer) = i64::from_str_radix(&value.replace("0x", ""), 16) {
-            // Hexadecimal integer literal
-            Value::Integer(integer)
-        } else if let Ok(interrupt) = InterruptType::from_str(&value) {
-            // Interrupt type
-            Value::Interrupt(interrupt)
-        } else if re_string.is_match(&value) {
-            // String
-            Value::String(value.replace("\"", ""))
-        } else if re_ident.is_match(&value) && map.contains_key(&value) {
-            // Identifier
-            map.get(&value).unwrap().to_owned()
-        } else {
-            // We will handle this particular case after, so no need to report it.
-            if chip != Chip::Esp32 && identifier != "XCHAL_USE_MEMCTL" {
-                println!("Unable to process definition: {} = {}", identifier, value);
-            }
-            continue;
-        };
-
-        map.insert(identifier, value);
-    }
-
-    Ok(map)
+fn comment(i: &str) -> IResult<&str, &str> {
+    delimited(tag("/*"), is_not("*/"), tag("*/"))(i)
 }
 
-fn find_all_defines(chip: Chip) -> Result<Vec<String>> {
-    let path = chip.core_isa_path()?;
-    let lines = fs::read_to_string(path)?
-        .lines()
-        .filter_map(|line| {
-            if line.starts_with("#define") {
-                Some(line.to_string())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    Ok(lines)
+fn whitespace(i: &str) -> IResult<&str, Vec<&str>> {
+    many0(alt((comment, multispace1)))(i)
 }
 
-fn fix_esp32_xchal_use_memctl(map: &mut HashMap<String, Value>) {
-    // NOTE: the value of `use_memctl` should subsequently be AND'ed with
-    //       '(XCHAL_HW_MIN_VERSION >= XTENSA_HWVERSION_RE_2012_0)', however
-    //       the latter identifier is not defined anywhere.
-    macro_rules! to_integer {
-        ($identifier:expr) => {
-            map.get($identifier)
-                .unwrap()
-                .as_integer()
-                .unwrap()
-                .to_owned()
-        };
-    }
+fn decimal(i: &str) -> IResult<&str, i64> {
+    map_res(digit1, |out: &str| i64::from_str_radix(&out, 10))(i)
+}
 
-    let loop_buffer_size = to_integer!("XCHAL_LOOP_BUFFER_SIZE");
-    let dcache_is_coherent = to_integer!("XCHAL_DCACHE_IS_COHERENT");
-    let have_icache_dyn_ways = to_integer!("XCHAL_HAVE_ICACHE_DYN_WAYS");
-    let have_dcache_dyn_ways = to_integer!("XCHAL_HAVE_DCACHE_DYN_WAYS");
+fn hexadecimal(i: &str) -> IResult<&str, i64> {
+    map_res(
+        preceded(alt((tag("0x"), tag("0X"))), hex_digit1),
+        |out: &str| i64::from_str_radix(&out, 16),
+    )(i)
+}
 
-    let use_memctl = (loop_buffer_size > 0)
-        || dcache_is_coherent != 0
-        || have_icache_dyn_ways != 0
-        || have_dcache_dyn_ways != 0;
+fn integer(i: &str) -> IResult<&str, i64> {
+    alt((hexadecimal, decimal))(i)
+}
 
-    let identifier = String::from("XCHAL_USE_MEMCTL");
-    let value = Value::Integer(use_memctl as i64);
+fn string(i: &str) -> IResult<&str, &str> {
+    delimited(char('"'), is_not("\""), char('"'))(i)
+}
 
-    map.insert(identifier, value);
+fn identifier(i: &str) -> IResult<&str, &str> {
+    recognize(pair(
+        alt((alpha1, tag("_"))),
+        many0(alt((alphanumeric1, tag("_")))),
+    ))(i)
+}
+
+fn definition(i: &str) -> IResult<&str, &str> {
+    todo!()
 }
