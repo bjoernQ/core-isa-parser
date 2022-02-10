@@ -5,12 +5,9 @@ use enum_as_inner::EnumAsInner;
 use regex::Regex;
 use strum_macros::{Display, EnumIter, EnumString};
 
-// Note that for the ESP32, since we are not using an RTOS we need to use the
-// 'xtensa_esp108' overlay instead of the 'xtensa_esp32' overlay.
-// https://docs.espressif.com/projects/esp-idf/en/v3.3.5/api-guides/jtag-debugging/tips-and-quirks.html
 #[derive(Debug, Clone, Copy, PartialEq, Display, EnumIter)]
 pub enum Chip {
-    #[strum(to_string = "xtensa_esp108")]
+    #[strum(to_string = "xtensa_esp32")]
     Esp32,
     #[strum(to_string = "xtensa_esp32s2")]
     Esp32s2,
