@@ -55,15 +55,8 @@ pub enum Value {
 }
 
 pub fn get_config(chip: Chip) -> Result<HashMap<String, Value>> {
-        // Parse the definitions for the chip from its 'core-isa.h' file. Note that for
-        // the ESP32 there is a single definition which requires special handling.
-        let mut config = parse_defines(chip)?;
-        if chip == Chip::Esp32 {
-            fix_esp32_xchal_use_memctl(&mut config);
-        }
-        Ok(config)
+        Ok(parse_defines(chip)?)
 }
-
 
 fn parse_defines(chip: Chip) -> Result<HashMap<String, Value>> {
     let re_define = Regex::new(r"^#define[\s]+([a-zA-Z\d_]+)[\s]+([^\s]+)")?;
@@ -126,34 +119,4 @@ fn find_all_defines(chip: Chip) -> Result<Vec<String>> {
         .collect::<Vec<_>>();
 
     Ok(lines)
-}
-
-fn fix_esp32_xchal_use_memctl(map: &mut HashMap<String, Value>) {
-    // NOTE: the value of `use_memctl` should subsequently be AND'ed with
-    //       '(XCHAL_HW_MIN_VERSION >= XTENSA_HWVERSION_RE_2012_0)', however
-    //       the latter identifier is not defined anywhere.
-    macro_rules! to_integer {
-        ($identifier:expr) => {
-            map.get($identifier)
-                .unwrap()
-                .as_integer()
-                .unwrap()
-                .to_owned()
-        };
-    }
-
-    let loop_buffer_size = to_integer!("XCHAL_LOOP_BUFFER_SIZE");
-    let dcache_is_coherent = to_integer!("XCHAL_DCACHE_IS_COHERENT");
-    let have_icache_dyn_ways = to_integer!("XCHAL_HAVE_ICACHE_DYN_WAYS");
-    let have_dcache_dyn_ways = to_integer!("XCHAL_HAVE_DCACHE_DYN_WAYS");
-
-    let use_memctl = (loop_buffer_size > 0)
-        || dcache_is_coherent != 0
-        || have_icache_dyn_ways != 0
-        || have_dcache_dyn_ways != 0;
-
-    let identifier = String::from("XCHAL_USE_MEMCTL");
-    let value = Value::Integer(use_memctl as i64);
-
-    map.insert(identifier, value);
 }
